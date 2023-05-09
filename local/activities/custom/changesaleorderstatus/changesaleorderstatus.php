@@ -1,5 +1,9 @@
 <?php if (!defined("B_PROLOG_INCLUDED") || B_PROLOG_INCLUDED!==true) { die(); }
 
+use Bitrix\Crm;
+use Bitrix\Main;
+use Bitrix\Main\Localization\Loc;
+
 class CBPChangeSaleOrderStatus
 	extends CBPActivity
 {
@@ -14,19 +18,104 @@ class CBPChangeSaleOrderStatus
 
 	public function Execute()
 	{
-		if (is_array($this->MapFields) && count($this->MapFields))
+		if (!Main\Loader::includeModule('crm') || !Main\Loader::includeModule('sale'))
 		{
-			$values = $this->__get("MapFields");
+			return CBPActivityExecutionStatus::Closed;
+		}
 
+		[$entityTypeName, $entityId] = explode('_', $this->GetDocumentId()[2]);
+
+		if ($entityTypeName !== \CCrmOwnerType::DealName)
+		{
+			$this->WriteToTrackingService(Loc::getMessage('CRM_SOAD_ORDER_ERROR'), 0, \CBPTrackingType::Error);
+			return CBPActivityExecutionStatus::Closed;
+		}
+
+		$ordersIds = Crm\Binding\OrderEntityTable::getOrderIdsByOwner($entityId, \CCrmOwnerType::Deal);
+
+		foreach ($ordersIds as $orderId)
+		{
+			$result = $this->updateOrderStatus($orderId);
 		}
 
 		return CBPActivityExecutionStatus::Closed;
 	}
 
+	private function updateOrderStatus(int $orderId = 0) : Main\Result
+	{
+		$result = new Main\Result();
+
+		$order = Crm\Order\Order::load($orderId);
+
+		if (!$order)
+		{
+			$this->WriteToTrackingService(Loc::getMessage('CRM_SOAD_ORDER_NOT_FOUND'), 0, \CBPTrackingType::Error);
+
+			$result->addError(new Main\Error(
+				Loc::getMessage('CRM_SOAD_ORDER_NOT_FOUND')
+			));
+
+			return $result;
+		}
+
+		$newStatus = '';
+
+		if (is_array($this->MapFields) && count($this->MapFields))
+		{
+			$values = $this->__get("MapFields");
+
+			$newStatus = trim($values['order_status']);
+
+			if ($newStatus === '')
+			{
+				$this->WriteToTrackingService(Loc::getMessage('CRM_SOAD_ORDER_PROPERTY_STATUS_EMPTY'), 0, \CBPTrackingType::Error);
+
+				$result->addError(new Main\Error(
+					Loc::getMessage('CRM_SOAD_ORDER_PROPERTY_STATUS_EMPTY')
+				));
+
+				return $result;
+			}
+		}
+
+		$orderData = $order->getField("STATUS_ID");
+		if ($orderData === $newStatus)
+		{
+			$this->WriteToTrackingService(Loc::getMessage('CRM_SOAD_ORDER_STATUS_EXIST'), 0, \CBPTrackingType::Error);
+
+			$result->addError(new Main\Error(
+				Loc::getMessage('CRM_SOAD_ORDER_STATUS_EXIST')
+			));
+
+			return $result;
+		}
+
+		$order->setField("STATUS_ID", $newStatus);
+
+		$resultOrder = $order->save();
+
+		/**
+		 * todo
+		 * The Yandex Market module throws an Exception and the order status does not change.
+		 * There are no errors in the order change result object and it was successfully saved???
+		 */
+
+		if (!$resultOrder->isSuccess())
+		{
+			foreach ($resultOrder->getErrorMessages() as $errorMessage)
+			{
+				$this->WriteToTrackingService($errorMessage, 0, \CBPTrackingType::Error);
+				$result->addError(new Main\Error(
+					$errorMessage
+				));
+			}
+		}
+
+		return $result;
+	}
+
 	public static function GetPropertiesDialog($documentType, $activityName, $arWorkflowTemplate, $arWorkflowParameters, $arWorkflowVariables, $arCurrentValues = null, $formName = "")
 	{
-		$runtime = CBPRuntime::GetRuntime();
-
 		if ( !is_array($arCurrentValues) )
 		{
 			$arCurrentValues = [];
@@ -36,7 +125,8 @@ class CBPChangeSaleOrderStatus
 			if (
 				is_array($arCurrentActivity["Properties"])
 				&& array_key_exists("MapFields", $arCurrentActivity["Properties"])
-				&& is_array($arCurrentActivity["Properties"]["MapFields"]))
+				&& is_array($arCurrentActivity["Properties"]["MapFields"])
+			)
 			{
 				foreach ($arCurrentActivity["Properties"]["MapFields"] as $k => $v)
 				{
@@ -45,8 +135,7 @@ class CBPChangeSaleOrderStatus
 			}
 		}
 
-		$runtime = CBPRuntime::GetRuntime();
-		return $runtime->ExecuteResourceFile(
+		return CBPRuntime::GetRuntime()->ExecuteResourceFile(
 			__FILE__,
 			"properties_dialog.php",
 			[
@@ -58,8 +147,7 @@ class CBPChangeSaleOrderStatus
 
 	public static function GetPropertiesDialogValues($documentType, $activityName, &$arWorkflowTemplate, &$arWorkflowParameters, &$arWorkflowVariables, $arCurrentValues, &$arErrors)
 	{
-		$runtime = CBPRuntime::GetRuntime();
-		$arProperties = array("MapFields" => array());
+		$arProperties = ["MapFields" => []];
 
 		if (
 			is_array($arCurrentValues)
