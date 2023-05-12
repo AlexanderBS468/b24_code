@@ -1,5 +1,6 @@
 <?php if (!defined("B_PROLOG_INCLUDED") || B_PROLOG_INCLUDED!==true) { die(); }
 
+use Bitrix\Bizproc;
 use Bitrix\Crm;
 use Bitrix\Main;
 use Bitrix\Main\Localization\Loc;
@@ -7,13 +8,17 @@ use Bitrix\Main\Localization\Loc;
 class CBPSaleOrderCalceled
 	extends CBPActivity
 {
+	private bool $writeLog;
+
 	public function __construct($name)
 	{
 		parent::__construct($name);
-		$this->arProperties = array(
+		$this->writeLog = true;
+		$this->arProperties = [
 			"Title" => "",
-			"MapFields" => null,
-		);
+			"CancelStatusId" => "",
+			"CancelReason" => ""
+		];
 	}
 
 	public function Execute()
@@ -35,82 +40,142 @@ class CBPSaleOrderCalceled
 
 		foreach ($ordersIds as $orderId)
 		{
-			$result = $this->updateOrderStatus($orderId);
+			$result = $this->doCancelOrder($orderId);
 		}
 
 		return CBPActivityExecutionStatus::Closed;
 	}
 
-	private function updateOrderStatus(int $orderId = 0) : Main\Result
+	private function doCancelOrder(int $orderId = 0) : Main\Result
 	{
 		$result = new Main\Result();
+
+		$order = Crm\Order\Order::load($orderId);
+
+		if (!$order)
+		{
+			$this->writeLog(Loc::getMessage('CRM_SOAD_ORDER_NOT_FOUND'));
+
+			$result->addError(new Main\Error(
+				Loc::getMessage('CRM_SOAD_ORDER_NOT_FOUND')
+			));
+
+			return $result;
+		}
+
+		if ($order->isCanceled())
+		{
+			$this->writeLog(Loc::getMessage('CRM_SOAD_ORDER_IS_CANCELED'));
+
+			$result->addError(new Main\Error(
+				Loc::getMessage('CRM_SOAD_ORDER_IS_CANCELED')
+			));
+		}
+
+		$cancelReason = (string)$this->CancelReason;
+		$cancelStatusId = (string)$this->CancelStatusId;
+
+		$result = $order->setField('STATUS_ID', $cancelStatusId);
+		if ($result->isSuccess() && $cancelReason)
+		{
+			$result = $order->setField('REASON_CANCELED', $cancelReason);
+		}
+
+		if ($result->isSuccess())
+		{
+			$result = $order->save();
+		}
+
+		if (!$result->isSuccess())
+		{
+			foreach ($result->getErrorMessages() as $errorMessage)
+			{
+				$this->writeLog($errorMessage);
+				$result->addError(new Main\Error(
+					$errorMessage
+				));
+			}
+		}
 
 		return $result;
 	}
 
-	public static function GetPropertiesDialog($documentType, $activityName, $arWorkflowTemplate, $arWorkflowParameters, $arWorkflowVariables, $arCurrentValues = null, $formName = "")
+	private function writeLog($mess = '', $type = \CBPTrackingType::Error, $modifyBy = 0 )
 	{
-		if ( !is_array($arCurrentValues) )
+		if ($this->writeLog && $mess !== '')
 		{
-			$arCurrentValues = [];
+			$this->WriteToTrackingService($mess, $modifyBy, $type);
+		}
+	}
 
-			$arCurrentActivity = &CBPWorkflowTemplateLoader::FindActivityByName($arWorkflowTemplate, $activityName);
+	public static function GetPropertiesDialog($documentType, $activityName, $arWorkflowTemplate, $arWorkflowParameters, $arWorkflowVariables, $arCurrentValues = null, $formName = "", $popupWindow = null, $siteId = '')
+	{
+		$dialog = new Bizproc\Activity\PropertiesDialog(__FILE__, [
+			'documentType' => $documentType,
+			'activityName' => $activityName,
+			'workflowTemplate' => $arWorkflowTemplate,
+			'workflowParameters' => $arWorkflowParameters,
+			'workflowVariables' => $arWorkflowVariables,
+			'currentValues' => $arCurrentValues,
+			'formName' => $formName,
+			'siteId' => $siteId
+		]);
 
-			if (
-				is_array($arCurrentActivity["Properties"])
-				&& array_key_exists("MapFields", $arCurrentActivity["Properties"])
-				&& is_array($arCurrentActivity["Properties"]["MapFields"])
-			)
+		$statuses = [];
+
+		foreach (Crm\Order\OrderStatus::getAllStatusesNames() as $statusId => $name)
+		{
+			if (Crm\Order\OrderStatus::getSemanticID($statusId) === Crm\PhaseSemantics::FAILURE)
 			{
-				foreach ($arCurrentActivity["Properties"]["MapFields"] as $k => $v)
-				{
-					$arCurrentValues["MapFields"][$k] = $v;
-				}
+				$statuses[$statusId] = $name;
 			}
 		}
 
-		return CBPRuntime::GetRuntime()->ExecuteResourceFile(
-			__FILE__,
-			"properties_dialog.php",
-			[
-				"arCurrentValues" => $arCurrentValues,
-				"formName" => $formName,
+		$dialog->setMap([
+			'CancelStatusId' => [
+				'Name' => Loc::getMessage('CRM_SOAD_STATUS_NAME'),
+				'FieldName' => 'cancel_status_id',
+				'Type' => 'select',
+				'Options' => $statuses
+			],
+			'CancelReason' => [
+				'Name' => Loc::getMessage('CRM_SOAD_COMMENT_NAME'),
+				'Description' => Loc::getMessage('CRM_SOAD_COMMENT_NAME'),
+				'FieldName' => 'cancel_reason',
+				'Type' => 'text'
 			]
-		);
+		]);
+
+		return $dialog;
 	}
 
 	public static function GetPropertiesDialogValues($documentType, $activityName, &$arWorkflowTemplate, &$arWorkflowParameters, &$arWorkflowVariables, $arCurrentValues, &$arErrors)
 	{
-		$arProperties = ["MapFields" => []];
+		$properties = [
+			'CancelStatusId' => $arCurrentValues['cancel_status_id'],
+			'CancelReason' => $arCurrentValues['cancel_reason'],
+		];
 
-		if (
-			is_array($arCurrentValues)
-			&& count($arCurrentValues) > 0
-			&& is_array($arCurrentValues["fields"])
-			&& is_array($arCurrentValues["values"])
-			&& count($arCurrentValues["fields"]) > 0
-			&& count($arCurrentValues["values"]) > 0
-		)
+		$errors = self::ValidateProperties($properties, new CBPWorkflowTemplateUser(CBPWorkflowTemplateUser::CurrentUser));
+		if (count($errors) > 0)
 		{
-			foreach($arCurrentValues["fields"] as $key => $value)
-			{
-				if ($value !== '' && $arCurrentValues["values"][$key] !== '')
-				{
-					$arProperties["MapFields"][$value] = $arCurrentValues["values"][$key];
-				}
-			}
+			return false;
 		}
 
-		$arCurrentActivity = &CBPWorkflowTemplateLoader::FindActivityByName($arWorkflowTemplate, $activityName);
-		$arCurrentActivity["Properties"] = $arProperties;
+		$currentActivity = &CBPWorkflowTemplateLoader::FindActivityByName($arWorkflowTemplate, $activityName);
+		$currentActivity["Properties"] = $properties;
 
 		return true;
 	}
 
-	public static function ValidateProperties($arTestProperties = array(), CBPWorkflowTemplateUser $user = null)
+	public static function ValidateProperties($arTestProperties = array(), CBPWorkflowTemplateUser $user = null) : array
 	{
-		$arErrors = [];
+		$errors = [];
+		if (empty($arTestProperties["CancelStatusId"]))
+		{
+			$errors[] = array("code" => "NotExist", "parameter" => "TargetStatus", "message" => GetMessage("CRM_SOAD_STATUS_ERROR"));
+		}
 
-		return array_merge($arErrors, parent::ValidateProperties($arTestProperties, $user));
+		return array_merge($errors, parent::ValidateProperties($arTestProperties, $user));
 	}
 }
